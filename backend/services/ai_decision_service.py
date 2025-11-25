@@ -380,7 +380,36 @@ def _build_prompt_context(
     symbol_metadata: Optional[Dict[str, Any]] = None,
     symbol_order: Optional[List[str]] = None,
     sampling_interval: Optional[int] = None,
+    environment: str = "mainnet",
+    template_text: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Build complete prompt context for AI decision-making.
+
+    ⚠️ CRITICAL: This is the SINGLE and ONLY function responsible for building
+    prompt context variables. ALL prompt template variable generation MUST happen
+    here to ensure consistency between preview and actual AI decision execution.
+
+    DO NOT create separate context-building logic elsewhere. If you need to add
+    new template variables, add them here.
+
+    Args:
+        account: Trading account
+        portfolio: Portfolio data with positions
+        prices: Current market prices
+        news_section: Latest news summary
+        samples: Legacy price samples (deprecated)
+        target_symbol: Legacy single symbol (deprecated)
+        hyperliquid_state: Real-time Hyperliquid account state
+        symbol_metadata: Symbol display names and metadata
+        symbol_order: Ordered list of symbols
+        sampling_interval: Sampling interval in seconds
+        environment: Trading environment (mainnet/testnet)
+        template_text: Prompt template text for parsing K-line variables
+
+    Returns:
+        Complete context dictionary ready for template.format_map()
+    """
     base_portfolio = portfolio or {}
     base_positions = base_portfolio.get("positions") or {}
     positions: Dict[str, Dict[str, Any]] = {symbol: dict(data) for symbol, data in base_positions.items()}
@@ -416,7 +445,7 @@ def _build_prompt_context(
     selected_symbols_csv = ", ".join(ordered_symbols) if ordered_symbols else "N/A"
     output_symbol_choices = "|".join(ordered_symbols) if ordered_symbols else "SYMBOL"
 
-    environment = getattr(account, "hyperliquid_environment", "testnet") or "testnet"
+    # NOTE: environment parameter is now passed from caller (call_ai_for_decision)
 
     # Use Hyperliquid state if provided (indicates Hyperliquid trading mode)
     if hyperliquid_state and environment in ("testnet", "mainnet"):
@@ -575,6 +604,29 @@ def _build_prompt_context(
         maintenance_margin = "N/A"
         positions_detail = "No open positions"
 
+    # ============================================================================
+    # K-LINE AND TECHNICAL INDICATORS PROCESSING
+    # ============================================================================
+    # Process K-line and technical indicator variables if template_text is provided.
+    # This ensures that variables like {BTC_klines_15m}, {BTC_MACD_15m}, etc.
+    # are properly populated with real data instead of showing "N/A".
+    #
+    # IMPORTANT: This processing MUST stay inside _build_prompt_context to ensure
+    # preview and AI decision execution use the same logic.
+    kline_context = {}
+    if template_text:
+        try:
+            from database.connection import SessionLocal
+            variable_groups = _parse_kline_indicator_variables(template_text)
+            if variable_groups:
+                with SessionLocal() as db:
+                    kline_context = _build_klines_and_indicators_context(
+                        variable_groups, db, environment
+                    )
+                logger.debug(f"Built K-line context with {len(kline_context)} variables")
+        except Exception as e:
+            logger.warning(f"Failed to build K-line context: {e}", exc_info=True)
+
     return {
         # Legacy variables (for Default prompt and backward compatibility)
         "account_state": account_state,
@@ -616,6 +668,8 @@ def _build_prompt_context(
         "margin_usage_percent": margin_usage_percent,
         "maintenance_margin": maintenance_margin,
         "positions_detail": positions_detail,
+        # K-line and technical indicator variables (dynamically generated)
+        **kline_context,  # Merge K-line/indicator variables like {BTC_klines_15m}, {BTC_MACD_15m}, etc.
     }
 
 
@@ -758,6 +812,10 @@ def call_ai_for_decision(
         logger.info(f"Skipping AI trading for account {account.name} - using default API key")
         return None
 
+    # IMPORTANT: Get global trading mode at the start
+    from services.hyperliquid_environment import get_global_trading_mode
+    global_environment = get_global_trading_mode(db)
+
     try:
         news_summary = fetch_latest_news()
         news_section = news_summary if news_summary else "No recent CoinJournal news available."
@@ -805,6 +863,8 @@ def call_ai_for_decision(
             symbol_metadata=active_symbol_metadata,
             symbol_order=symbol_order,
             sampling_interval=sampling_interval,
+            environment=global_environment,
+            template_text=template.template_text,
         )
         context["sampling_data"] = sampling_data
     else:
@@ -832,6 +892,8 @@ def call_ai_for_decision(
             symbol_metadata=active_symbol_metadata,
             symbol_order=symbol_order,
             sampling_interval=sampling_interval,
+            environment=global_environment,
+            template_text=template.template_text,
         )
 
     try:
@@ -1316,7 +1378,9 @@ def save_ai_decision(
                     prev_portion = symbol_value / total_balance
 
         # Get Hyperliquid environment for decision tagging
-        hyperliquid_environment = getattr(account, "hyperliquid_environment", None)
+        # IMPORTANT: Always use global trading mode for accurate logging
+        from services.hyperliquid_environment import get_global_trading_mode
+        hyperliquid_environment = get_global_trading_mode(db)
 
         # Create decision log entry
         decision_log = AIDecisionLog(
@@ -1409,3 +1473,337 @@ def get_active_ai_accounts(db: Session) -> List[Account]:
         return []
         
     return valid_accounts
+
+
+def _parse_kline_indicator_variables(template_text: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Parse K-line and indicator variables from prompt template.
+
+    Extracts variables like:
+    - {BTC_klines_15m}(200) - K-line data
+    - {BTC_RSI14_15m} - Technical indicators
+    - {BTC_market_data} - Market ticker data
+
+    Returns grouped by (symbol, period) for optimization:
+    {
+        ('BTC', '15m'): {
+            'klines': {'count': 200},
+            'indicators': ['RSI14', 'MACD'],
+            'market_data': True
+        },
+        ('BTC', None): {
+            'market_data': True
+        }
+    }
+    """
+    # Pattern for K-line variables: {SYMBOL_klines_PERIOD}(COUNT)
+    kline_pattern = r'\{([A-Z]+)_klines_(\w+)\}(?:\((\d+)\))?'
+
+    # Pattern for indicator variables: {SYMBOL_INDICATOR_PERIOD}
+    indicator_pattern = r'\{([A-Z]+)_(RSI\d+|MACD|MA\d*|EMA\d*|BOLL|ATR\d+)_(\w+)\}'
+    
+    # Pattern for market data: {SYMBOL_market_data}
+    market_data_pattern = r'\{([A-Z]+)_market_data\}'
+
+    grouped = {}
+
+    # Parse K-line variables
+    for match in re.finditer(kline_pattern, template_text):
+        symbol = match.group(1)
+        period = match.group(2)
+        count = int(match.group(3)) if match.group(3) else 500  # Default 500
+
+        key = (symbol, period)
+        if key not in grouped:
+            grouped[key] = {'klines': None, 'indicators': [], 'market_data': False}
+        grouped[key]['klines'] = {'count': count}
+
+        logger.debug(f"Found K-line variable: {symbol}_klines_{period}({count})")
+
+    # Parse indicator variables
+    for match in re.finditer(indicator_pattern, template_text):
+        symbol = match.group(1)
+        indicator = match.group(2)
+        period = match.group(3)
+
+        key = (symbol, period)
+        if key not in grouped:
+            grouped[key] = {'klines': None, 'indicators': [], 'market_data': False}
+
+        # Handle compound indicators (MA, EMA expand to multiple)
+        if indicator == 'MA':
+            grouped[key]['indicators'].extend(['MA5', 'MA10', 'MA20'])
+        elif indicator == 'EMA':
+            grouped[key]['indicators'].extend(['EMA20', 'EMA50'])
+        else:
+            grouped[key]['indicators'].append(indicator)
+
+        logger.debug(f"Found indicator variable: {symbol}_{indicator}_{period}")
+    
+    # Parse market data variables
+    for match in re.finditer(market_data_pattern, template_text):
+        symbol = match.group(1)
+        
+        key = (symbol, None)
+        if key not in grouped:
+            grouped[key] = {'klines': None, 'indicators': [], 'market_data': False}
+        grouped[key]['market_data'] = True
+        
+        logger.debug(f"Found market data variable: {symbol}_market_data")
+
+    # Remove duplicates from indicators list
+    for key in grouped:
+        grouped[key]['indicators'] = list(set(grouped[key]['indicators']))
+
+    logger.info(f"Parsed {len(grouped)} groups of K-line/indicator/market-data variables")
+    return grouped
+
+
+def _format_single_indicator(indicator_name: str, indicator_data: Any) -> str:
+    """
+    Format a single technical indicator for prompt injection.
+
+    Args:
+        indicator_name: Name of the indicator (e.g., 'RSI14', 'MACD')
+        indicator_data: Calculated indicator data
+
+    Returns:
+        Formatted string for prompt
+    """
+    if not indicator_data:
+        return "N/A"
+
+    try:
+        if indicator_name.startswith('RSI'):
+            # RSI format: value + interpretation + last 5 values
+            values = indicator_data if isinstance(indicator_data, list) else []
+            if not values:
+                return "N/A"
+
+            current = values[-1]
+            last_5 = values[-5:] if len(values) >= 5 else values
+
+            # Interpret RSI value
+            if current > 70:
+                interpretation = "Overbought"
+            elif current < 30:
+                interpretation = "Oversold"
+            else:
+                interpretation = "Neutral"
+
+            result = [
+                f"{indicator_name}: {current:.2f} ({interpretation})",
+                f"{indicator_name} last 5: {', '.join(f'{v:.2f}' for v in last_5)}"
+            ]
+            return "\n".join(result)
+
+        elif indicator_name == 'MACD':
+            # MACD format: MACD line, Signal line, Histogram + interpretation
+            macd_line = indicator_data.get('macd', [])
+            signal_line = indicator_data.get('signal', [])
+            histogram = indicator_data.get('histogram', [])
+
+            if not macd_line or not signal_line or not histogram:
+                return "N/A"
+
+            current_macd = macd_line[-1]
+            current_signal = signal_line[-1]
+            current_hist = histogram[-1]
+            last_5_hist = histogram[-5:] if len(histogram) >= 5 else histogram
+
+            # Interpret MACD
+            momentum = "Bullish momentum" if current_hist > 0 else "Bearish momentum"
+
+            result = [
+                f"MACD Line: {current_macd:.4f}",
+                f"Signal Line: {current_signal:.4f}",
+                f"Histogram: {current_hist:.4f} ({momentum})",
+                f"Histogram last 5: {', '.join(f'{v:.4f}' for v in last_5_hist)}"
+            ]
+            return "\n".join(result)
+
+        elif indicator_name.startswith('MA') or indicator_name.startswith('EMA'):
+            # Moving average format: current value + last 5 values
+            values = indicator_data if isinstance(indicator_data, list) else []
+            if not values:
+                return "N/A"
+
+            current = values[-1]
+            last_5 = values[-5:] if len(values) >= 5 else values
+
+            result = [
+                f"{indicator_name}: {current:.2f}",
+                f"{indicator_name} last 5: {', '.join(f'{v:.2f}' for v in last_5)}"
+            ]
+            return "\n".join(result)
+
+        elif indicator_name == 'BOLL':
+            # Bollinger Bands format: Upper, Middle, Lower bands
+            upper = indicator_data.get('upper', [])
+            middle = indicator_data.get('middle', [])
+            lower = indicator_data.get('lower', [])
+
+            if not upper or not middle or not lower:
+                return "N/A"
+
+            result = [
+                f"Upper Band: {upper[-1]:.2f}",
+                f"Middle Band: {middle[-1]:.2f}",
+                f"Lower Band: {lower[-1]:.2f}",
+                f"Band Width: {(upper[-1] - lower[-1]):.2f}"
+            ]
+            return "\n".join(result)
+
+        elif indicator_name.startswith('ATR'):
+            # ATR format: current value + interpretation
+            values = indicator_data if isinstance(indicator_data, list) else []
+            if not values:
+                return "N/A"
+
+            current = values[-1]
+            avg_atr = sum(values[-20:]) / min(len(values), 20) if values else 0
+
+            volatility = "High volatility" if current > avg_atr * 1.2 else "Normal volatility"
+
+            result = [
+                f"{indicator_name}: {current:.2f} ({volatility})",
+                f"20-period average: {avg_atr:.2f}"
+            ]
+            return "\n".join(result)
+
+        else:
+            return "N/A"
+
+    except Exception as e:
+        logger.error(f"Error formatting indicator {indicator_name}: {e}")
+        return "N/A"
+
+
+def _build_klines_and_indicators_context(
+    variable_groups: Dict[str, Dict[str, Any]],
+    db: Session,
+    environment: str = "mainnet"
+) -> Dict[str, str]:
+    """
+    Build K-line and indicator context for prompt filling.
+
+    Args:
+        variable_groups: Parsed variable groups from _parse_kline_indicator_variables
+        db: Database session
+        environment: Trading environment (mainnet/testnet)
+
+    Returns:
+        Dict mapping variable names to formatted strings
+    """
+    from services.market_data import get_kline_data, get_ticker_data
+    from services.technical_indicators import calculate_indicators
+    from services.kline_ai_analysis_service import _format_klines_summary
+
+    context = {}
+
+    for (symbol, period), requirements in variable_groups.items():
+        try:
+            # Handle market data (no period)
+            if period is None and requirements['market_data']:
+                logger.info(f"Processing market data for {symbol} in {environment}")
+                try:
+                    ticker = get_ticker_data(symbol, "CRYPTO", environment)
+                    if ticker:
+                        market_data_lines = [
+                            f"Symbol: {symbol}",
+                            f"Price: ${ticker['price']:.2f}",
+                            f"24h Change: {ticker['change24h']:+.2f} ({ticker['percentage24h']:+.2f}%)",
+                            f"24h Volume: ${ticker['volume24h']:,.0f}",
+                        ]
+                        if 'open_interest' in ticker:
+                            market_data_lines.append(f"Open Interest: ${ticker['open_interest']:,.0f}")
+                        if 'funding_rate' in ticker:
+                            market_data_lines.append(f"Funding Rate: {ticker['funding_rate']:.6f}%")
+
+                        var_name = f"{symbol}_market_data"
+                        context[var_name] = "\n".join(market_data_lines)
+                        logger.debug(f"Added market data variable: {var_name}")
+                except Exception as ticker_err:
+                    logger.warning(f"Failed to get ticker data for {symbol}: {ticker_err}")
+                continue
+
+            # Process K-lines and indicators (has period)
+            logger.info(f"Processing {symbol} {period} for environment: {environment}")
+
+            # Always fetch 500 candles for accurate indicator calculation
+            kline_data = get_kline_data(
+                symbol=symbol,
+                market="CRYPTO",
+                period=period,
+                count=500,
+                environment=environment
+            )
+
+            if not kline_data:
+                logger.warning(f"No K-line data for {symbol} {period} in {environment}")
+                continue
+
+            # Process K-line variables
+            if requirements['klines']:
+                count = requirements['klines']['count']
+                # Take last N candles for display
+                display_klines = kline_data[-count:] if len(kline_data) >= count else kline_data
+                formatted_klines = _format_klines_summary(display_klines)
+
+                # Variable name: {BTC_klines_15m}
+                var_name = f"{symbol}_klines_{period}"
+                context[var_name] = formatted_klines
+                logger.debug(f"Added K-line variable: {var_name} ({len(display_klines)} candles)")
+
+            # Calculate and process indicators
+            if requirements['indicators']:
+                indicators_to_calc = requirements['indicators']
+                calculated = calculate_indicators(kline_data, indicators_to_calc)
+
+                # Track compound indicators (MA, EMA) for merged output
+                ma_indicators = []
+                ema_indicators = []
+
+                for indicator_name in indicators_to_calc:
+                    indicator_data = calculated.get(indicator_name)
+                    formatted = _format_single_indicator(indicator_name, indicator_data)
+
+                    # Variable name: {BTC_RSI14_15m}
+                    var_name = f"{symbol}_{indicator_name}_{period}"
+                    context[var_name] = formatted
+                    logger.debug(f"Added indicator variable: {var_name}")
+
+                    # Track for compound output
+                    if indicator_name.startswith('MA') and indicator_name[2:].isdigit():
+                        ma_indicators.append((indicator_name, formatted))
+                    elif indicator_name.startswith('EMA') and indicator_name[3:].isdigit():
+                        ema_indicators.append((indicator_name, formatted))
+
+                # Generate compound MA variable: {BTC_MA_15m}
+                if ma_indicators:
+                    ma_lines = []
+                    for ind_name, ind_formatted in sorted(ma_indicators):
+                        ma_lines.append(f"**{ind_name}**")
+                        ma_lines.append(ind_formatted)
+                        ma_lines.append("")
+                    compound_var = f"{symbol}_MA_{period}"
+                    context[compound_var] = "\n".join(ma_lines).strip()
+                    logger.debug(f"Added compound MA variable: {compound_var}")
+
+                # Generate compound EMA variable: {BTC_EMA_15m}
+                if ema_indicators:
+                    ema_lines = []
+                    for ind_name, ind_formatted in sorted(ema_indicators):
+                        ema_lines.append(f"**{ind_name}**")
+                        ema_lines.append(ind_formatted)
+                        ema_lines.append("")
+                    compound_var = f"{symbol}_EMA_{period}"
+                    context[compound_var] = "\n".join(ema_lines).strip()
+                    logger.debug(f"Added compound EMA variable: {compound_var}")
+
+        except Exception as e:
+            logger.error(f"Error processing {symbol} {period}: {e}", exc_info=True)
+            continue
+
+    logger.info(f"Built context with {len(context)} variables for environment: {environment}")
+    return context

@@ -244,8 +244,12 @@ def preview_prompt(
             logger.warning(f"Account {account_id} not found, skipping")
             continue
 
-        # Check if account uses Hyperliquid
-        hyperliquid_environment = getattr(account, "hyperliquid_environment", None)
+        # Check if account uses Hyperliquid - ONLY use global environment
+        from services.hyperliquid_environment import get_global_trading_mode
+        hyperliquid_environment = get_global_trading_mode(db)
+
+        # NOTE: Account-level environment setting is deprecated
+        # All accounts MUST follow the global trading mode
 
         hyperliquid_state = None
 
@@ -254,7 +258,7 @@ def preview_prompt(
             try:
                 from services.hyperliquid_environment import get_hyperliquid_client
 
-                client = get_hyperliquid_client(db, account_id)
+                client = get_hyperliquid_client(db, account_id, override_environment=hyperliquid_environment)
                 account_state = client.get_account_state(db)
                 positions = client.get_positions(db)
 
@@ -319,7 +323,7 @@ def preview_prompt(
         prices: Dict[str, float] = {}
         for sym in active_symbols:
             try:
-                prices[sym] = get_last_price(sym, "CRYPTO")
+                prices[sym] = get_last_price(sym, "CRYPTO", environment=hyperliquid_environment or "mainnet")
             except Exception as err:
                 logger.warning(f"Failed to get price for {sym}: {err}")
                 prices[sym] = 0.0
@@ -335,6 +339,9 @@ def preview_prompt(
             logger.warning(f"Failed to get sampling interval: {e}")
 
         sampling_data = _build_multi_symbol_sampling_data(active_symbols, sampling_pool, sampling_interval)
+        # IMPORTANT: _build_prompt_context is the ONLY function that builds prompt context.
+        # It now handles K-line and indicator variables internally when template_text is provided.
+        # DO NOT add separate K-line processing here - it will cause inconsistencies.
         context = _build_prompt_context(
             account,
             portfolio,
@@ -346,6 +353,8 @@ def preview_prompt(
             symbol_metadata=symbol_metadata_map,
             symbol_order=active_symbols,
             sampling_interval=sampling_interval,
+            environment=hyperliquid_environment or "mainnet",
+            template_text=template.template_text,
         )
         context["sampling_data"] = sampling_data
 
