@@ -176,6 +176,7 @@ Hyperliquid supports two wallet types. Choose the method that matches your setup
   - **Rabby**: Settings → Export Private Key
   - Other wallets: Check their documentation for private key export
 - This is the most common method for users who already have Web3 wallets
+- Official guide: https://hyperliquid.gitbook.io/hyperliquid-docs/onboarding/how-to-start-trading
 
 **Option B: Using Hyperliquid Email Wallet**
 - If you logged into Hyperliquid using email (not wallet connection)
