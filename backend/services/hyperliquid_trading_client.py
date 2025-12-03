@@ -169,6 +169,13 @@ class HyperliquidTradingClient:
             })
             self._disable_hip3_markets()
 
+            # Load markets to initialize token mappings (required for CCXT 4.5+)
+            try:
+                self.exchange.load_markets()
+                logger.info(f"CCXT markets loaded successfully for {environment}")
+            except Exception as market_err:
+                logger.warning(f"Failed to load CCXT markets (non-critical): {market_err}")
+
             logger.info(
                 f"CCXT HyperliquidClient initialized: account_id={account_id} "
                 f"environment={environment.upper()} wallet={self.wallet_address}"
